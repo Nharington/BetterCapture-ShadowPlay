@@ -151,6 +151,55 @@ final class NotificationService: NSObject {
         }
     }
 
+    func sendClipSavedNotification(fileURL: URL) {
+        let content = UNMutableNotificationContent()
+        content.title = "Clip Saved"
+        content.body = "Your clip has been saved to \(fileURL.lastPathComponent)"
+        content.sound = .default
+        content.categoryIdentifier = NotificationIdentifier.categoryRecordingSaved
+
+        let folderURL = fileURL.deletingLastPathComponent()
+        content.userInfo = [UserInfoKey.folderURL: folderURL.path()]
+
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil
+        )
+
+        Task {
+            do {
+                try await UNUserNotificationCenter.current().add(request)
+                logger.info("Clip saved notification sent")
+            } catch {
+                logger.error("Failed to send clip notification: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func sendClipFailedNotification(error: Error) {
+        let content = UNMutableNotificationContent()
+        content.title = "Clip Failed"
+        content.body = "Your clip could not be saved: \(error.localizedDescription)"
+        content.sound = .default
+        content.categoryIdentifier = NotificationIdentifier.categoryRecordingFailed
+
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil
+        )
+
+        Task {
+            do {
+                try await UNUserNotificationCenter.current().add(request)
+                logger.info("Clip failed notification sent")
+            } catch {
+                logger.error("Failed to send clip failure notification: \(error.localizedDescription)")
+            }
+        }
+    }
+
     /// Sends a notification when recording stopped unexpectedly
     /// - Parameter error: Optional error that caused the stop
     func sendRecordingStoppedNotification(error: Error?) {

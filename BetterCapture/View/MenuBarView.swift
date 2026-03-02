@@ -100,6 +100,10 @@ struct MenuBarView: View {
 
             MenuBarDivider()
 
+            ShadowPlayMenuBarSection(viewModel: viewModel)
+
+            MenuBarDivider()
+
             // Settings Sections (no divider between them - section headers provide separation)
             VideoSettingsSection(settings: viewModel.settings)
 
@@ -152,6 +156,115 @@ struct MenuBarView: View {
                 }
             }
             .padding(.vertical, 8)
+        }
+    }
+}
+
+// MARK: - ShadowPlay Section
+
+struct ShadowPlayMenuBarSection: View {
+    @Bindable var viewModel: RecorderViewModel
+
+    private var settings: SettingsStore { viewModel.settings }
+
+    private var bufferMinutes: Binding<Int> {
+        Binding(
+            get: { settings.shadowPlayBufferMinutes },
+            set: {
+                settings.shadowPlayBufferMinutes = $0
+                if settings.shadowPlayDefaultClipMinutes > settings.shadowPlayBufferMinutes {
+                    settings.shadowPlayDefaultClipMinutes = settings.shadowPlayBufferMinutes
+                }
+            }
+        )
+    }
+
+    private var clipMinutes: Binding<Int> {
+        Binding(
+            get: { min(settings.shadowPlayDefaultClipMinutes, settings.shadowPlayBufferMinutes) },
+            set: { settings.shadowPlayDefaultClipMinutes = min($0, settings.shadowPlayBufferMinutes) }
+        )
+    }
+
+    private var isShadowPlaySelectionValid: Bool {
+        viewModel.canStartShadowPlay || viewModel.isShadowPlayActive
+    }
+
+    private var bufferOptions: [(value: Int, label: String)] {
+        let candidates = [1, 2, 5, 10, 15, 20]
+        let options = candidates.contains(bufferMinutes.wrappedValue)
+            ? candidates
+            : candidates + [bufferMinutes.wrappedValue]
+        return options
+            .sorted()
+            .map { ($0, "\($0) min") }
+    }
+
+    private var clipOptions: [(value: Int, label: String)] {
+        let maxMinutes = settings.shadowPlayBufferMinutes
+        let candidates = [1, 2, 3, 5, 10, 15, 20].filter { $0 <= maxMinutes }
+        let options = candidates.contains(clipMinutes.wrappedValue)
+            ? candidates
+            : candidates + [clipMinutes.wrappedValue]
+        return options
+            .sorted()
+            .filter { $0 <= maxMinutes }
+            .map { ($0, "\($0) min") }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            SectionHeader(title: "ShadowPlay")
+
+            MenuBarActionButton(
+                title: viewModel.isShadowPlayActive ? "Stop ShadowPlay" : "Start ShadowPlay",
+                systemImage: viewModel.isShadowPlayActive ? "stop.circle" : "play.circle",
+                accentColor: viewModel.isShadowPlayActive ? .red : .blue,
+                isDisabled: !viewModel.isShadowPlayActive && !viewModel.canStartShadowPlay
+            ) {
+                Task {
+                    if viewModel.isShadowPlayActive {
+                        await viewModel.stopShadowPlay()
+                    } else {
+                        await viewModel.startShadowPlay()
+                    }
+                }
+            }
+            .padding(.top, 4)
+
+            if !isShadowPlaySelectionValid {
+                Text("ShadowPlay requires a display or area selection.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 4)
+            }
+
+            MenuBarExpandablePicker(
+                name: "Buffer",
+                selection: bufferMinutes,
+                options: bufferOptions
+            )
+
+            MenuBarExpandablePicker(
+                name: "Clip Length",
+                selection: clipMinutes,
+                options: clipOptions
+            )
+
+            MenuBarActionButton(
+                title: viewModel.isSavingShadowPlayClip ? "Saving Clip..." : "Save Clip",
+                systemImage: "scissors",
+                accentColor: .blue,
+                isDisabled: !viewModel.isShadowPlayActive || viewModel.isSavingShadowPlayClip
+            ) {
+                Task {
+                    let minutes = settings.shadowPlayDefaultClipMinutes
+                    await viewModel.saveShadowPlayClip(duration: .seconds(Int64(minutes * 60)))
+                }
+            }
+            .padding(.bottom, 4)
         }
     }
 }

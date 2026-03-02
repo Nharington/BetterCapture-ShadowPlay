@@ -46,7 +46,15 @@ final class RecorderViewModel {
     }
 
     var canStartRecording: Bool {
-        selectedContentFilter != nil && state == .idle
+        selectedContentFilter != nil && state == .idle && !isShadowPlayActive
+    }
+
+    private var isDisplayCaptureSelection: Bool {
+        selectedContentFilter?.includedDisplays.isEmpty == false
+    }
+
+    var canStartShadowPlay: Bool {
+        state == .idle && !isShadowPlayActive && (isAreaSelection || isDisplayCaptureSelection)
     }
 
     var hasContentSelected: Bool {
@@ -68,6 +76,11 @@ final class RecorderViewModel {
     /// Whether Presenter Overlay is currently active (camera composited into stream)
     private(set) var isPresenterOverlayActive = false
 
+    // MARK: - ShadowPlay State
+
+    private(set) var isShadowPlayActive = false
+    private(set) var isSavingShadowPlayClip = false
+
     // MARK: - Dependencies
 
     let settings: SettingsStore
@@ -78,6 +91,8 @@ final class RecorderViewModel {
     let permissionService: PermissionService
     private let captureEngine: CaptureEngine
     private let assetWriter: AssetWriter
+    private let shadowPlayBufferWriter: ShadowPlayBufferWriter
+    private let shadowPlayClipExporter: ShadowPlayClipExporter
     private let cameraSession = CameraSession()
 
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "BetterCapture", category: "RecorderViewModel")
@@ -101,6 +116,8 @@ final class RecorderViewModel {
         self.permissionService = PermissionService()
         self.captureEngine = CaptureEngine()
         self.assetWriter = AssetWriter()
+        self.shadowPlayBufferWriter = ShadowPlayBufferWriter()
+        self.shadowPlayClipExporter = ShadowPlayClipExporter()
 
         captureEngine.delegate = self
         captureEngine.sampleBufferDelegate = assetWriter
@@ -222,6 +239,9 @@ final class RecorderViewModel {
             }
             logger.info("Video size: \(self.videoSize.width)x\(self.videoSize.height)")
 
+            // Ensure we route sample buffers to the file writer (delegate must not change during capture)
+            captureEngine.sampleBufferDelegate = assetWriter
+
             // Access security-scoped output directory before writing
             _ = settings.startAccessingOutputDirectory()
 
@@ -321,6 +341,127 @@ final class RecorderViewModel {
         await previewService.stopPreview()
     }
 
+    // MARK: - ShadowPlay Methods
+
+    func startShadowPlay() async {
+        guard canStartShadowPlay else {
+            logger.warning("Cannot start ShadowPlay: invalid selection or already active")
+            return
+        }
+
+        do {
+            lastError = nil
+
+            // Stop any active live preview before starting capture
+            await previewService.stopPreview()
+
+            if let filter = selectedContentFilter {
+                videoSize = await getContentSize(from: filter)
+            }
+
+            let configuration = ShadowPlayBufferWriter.Configuration(
+                containerFormat: settings.containerFormat,
+                videoCodec: settings.videoCodec,
+                audioCodec: settings.audioCodec,
+                captureSystemAudio: settings.captureSystemAudio,
+                captureMicrophone: settings.captureMicrophone,
+                captureAlphaChannel: settings.captureAlphaChannel,
+                captureHDR: settings.captureHDR,
+                bufferDuration: .seconds(Int64(settings.shadowPlayBufferMinutes * 60)),
+                segmentDuration: .seconds(Int64(settings.shadowPlaySegmentSeconds))
+            )
+
+            try shadowPlayBufferWriter.configure(configuration, videoSize: videoSize)
+            shadowPlayBufferWriter.reset()
+
+            // Ensure we route sample buffers to the rolling buffer writer
+            captureEngine.sampleBufferDelegate = shadowPlayBufferWriter
+
+            try await captureEngine.startCapture(with: settings, videoSize: videoSize, sourceRect: selectedSourceRect)
+            isShadowPlayActive = true
+            settings.shadowPlayEnabled = true
+            logger.info("ShadowPlay started")
+
+        } catch {
+            lastError = error
+            isShadowPlayActive = false
+            settings.shadowPlayEnabled = false
+            shadowPlayBufferWriter.reset()
+            if !captureEngine.isCapturing {
+                captureEngine.sampleBufferDelegate = assetWriter
+            }
+            logger.error("Failed to start ShadowPlay: \(error.localizedDescription)")
+        }
+    }
+
+    func stopShadowPlay() async {
+        guard isShadowPlayActive else { return }
+
+        do {
+            try await captureEngine.stopCapture()
+            isShadowPlayActive = false
+            settings.shadowPlayEnabled = false
+            shadowPlayBufferWriter.reset()
+            captureEngine.sampleBufferDelegate = assetWriter
+            logger.info("ShadowPlay stopped")
+        } catch {
+            lastError = error
+            if captureEngine.isCapturing {
+                // Capture is still running, so ShadowPlay is still effectively active.
+                // Keep the buffer writer configured and continue receiving samples until capture actually stops.
+                isShadowPlayActive = true
+                settings.shadowPlayEnabled = true
+            } else {
+                // Capture has stopped (or never fully started), so complete cleanup.
+                isShadowPlayActive = false
+                settings.shadowPlayEnabled = false
+                shadowPlayBufferWriter.reset()
+                captureEngine.sampleBufferDelegate = assetWriter
+            }
+            logger.error("Failed to stop ShadowPlay: \(error.localizedDescription)")
+        }
+    }
+
+    func saveShadowPlayClip(duration: Duration) async {
+        guard isShadowPlayActive else { return }
+        guard duration > .zero else { return }
+
+        let maxDuration = Duration.seconds(Int64(settings.shadowPlayBufferMinutes * 60))
+        let clipDuration = ShadowPlayClipDuration.clamped(requested: duration, buffer: maxDuration)
+
+        isSavingShadowPlayClip = true
+        defer { isSavingShadowPlayClip = false }
+
+        do {
+            await shadowPlayBufferWriter.flushCurrentSegment()
+
+            let segments = shadowPlayBufferWriter.snapshotSegments()
+            let slices = ShadowPlaySegmentSelection.slicesForLast(duration: clipDuration, from: segments)
+            guard !slices.isEmpty else { throw ShadowPlayClipExportError.noSegments }
+
+            let urls = slices.map { $0.segment.url }
+            let pinToken = shadowPlayBufferWriter.pin(urls: urls)
+            defer { shadowPlayBufferWriter.unpin(token: pinToken) }
+
+            _ = settings.startAccessingOutputDirectory()
+            defer { settings.stopAccessingOutputDirectory() }
+
+            let outputURL = settings.generateShadowPlayClipURL()
+            let savedURL = try await shadowPlayClipExporter.export(
+                slices: slices,
+                to: outputURL,
+                containerFormat: settings.containerFormat
+            )
+
+            notificationService.sendClipSavedNotification(fileURL: savedURL)
+
+        } catch {
+            lastError = error
+            notificationService.sendClipFailedNotification(error: error)
+            logger.error("Failed to save ShadowPlay clip: \(error.localizedDescription)")
+        }
+    }
+
     // MARK: - Timer Management
 
     private func startTimer() {
@@ -397,9 +538,15 @@ extension RecorderViewModel: CaptureEngineDelegate {
         // Check if user clicked "Stop Sharing" in the menu bar
         let isUserStopped = (error as? SCStreamError)?.code == .userStopped
 
-        if let error, !isUserStopped {
-            lastError = error
-            logger.error("Capture stopped with error: \(error.localizedDescription)")
+        if let error {
+            if !isUserStopped || isShadowPlayActive {
+                lastError = error
+                if isUserStopped && isShadowPlayActive {
+                    logger.warning("ShadowPlay capture stopped by system UI: \(error.localizedDescription)")
+                } else {
+                    logger.error("Capture stopped with error: \(error.localizedDescription)")
+                }
+            }
         }
 
         // Clean up if we were recording
@@ -417,6 +564,11 @@ extension RecorderViewModel: CaptureEngineDelegate {
                     await stopRecording()
                 }
             }
+        } else if isShadowPlayActive {
+            isShadowPlayActive = false
+            settings.shadowPlayEnabled = false
+            shadowPlayBufferWriter.reset()
+            captureEngine.sampleBufferDelegate = assetWriter
         }
     }
 

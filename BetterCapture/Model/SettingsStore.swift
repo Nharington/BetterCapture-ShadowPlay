@@ -402,6 +402,71 @@ final class SettingsStore {
         URL.homeDirectory.appending(path: "Movies/BetterCapture")
     }
 
+    // MARK: - ShadowPlay Settings
+
+    var shadowPlayEnabled: Bool {
+        get {
+            access(keyPath: \.shadowPlayEnabled)
+            return UserDefaults.standard.bool(forKey: "shadowPlayEnabled")
+        }
+        set {
+            withMutation(keyPath: \.shadowPlayEnabled) {
+                UserDefaults.standard.set(newValue, forKey: "shadowPlayEnabled")
+            }
+        }
+    }
+
+    /// Rolling buffer length (minutes).
+    var shadowPlayBufferMinutes: Int {
+        get {
+            access(keyPath: \.shadowPlayBufferMinutes)
+            guard UserDefaults.standard.object(forKey: "shadowPlayBufferMinutes") != nil else {
+                return 10
+            }
+            let value = UserDefaults.standard.integer(forKey: "shadowPlayBufferMinutes")
+            return max(1, value)
+        }
+        set {
+            withMutation(keyPath: \.shadowPlayBufferMinutes) {
+                UserDefaults.standard.set(max(1, newValue), forKey: "shadowPlayBufferMinutes")
+            }
+        }
+    }
+
+    /// Default clip length (minutes). The UI may override this per clip.
+    var shadowPlayDefaultClipMinutes: Int {
+        get {
+            access(keyPath: \.shadowPlayDefaultClipMinutes)
+            guard UserDefaults.standard.object(forKey: "shadowPlayDefaultClipMinutes") != nil else {
+                return 2
+            }
+            let value = UserDefaults.standard.integer(forKey: "shadowPlayDefaultClipMinutes")
+            return max(1, value)
+        }
+        set {
+            withMutation(keyPath: \.shadowPlayDefaultClipMinutes) {
+                UserDefaults.standard.set(max(1, newValue), forKey: "shadowPlayDefaultClipMinutes")
+            }
+        }
+    }
+
+    /// Segment duration used for rolling buffer management (seconds).
+    var shadowPlaySegmentSeconds: Int {
+        get {
+            access(keyPath: \.shadowPlaySegmentSeconds)
+            guard UserDefaults.standard.object(forKey: "shadowPlaySegmentSeconds") != nil else {
+                return 5
+            }
+            let value = UserDefaults.standard.integer(forKey: "shadowPlaySegmentSeconds")
+            return max(2, value)
+        }
+        set {
+            withMutation(keyPath: \.shadowPlaySegmentSeconds) {
+                UserDefaults.standard.set(max(2, newValue), forKey: "shadowPlaySegmentSeconds")
+            }
+        }
+    }
+
     /// Security-scoped bookmark data for the custom output directory
     private var customOutputDirectoryBookmark: Data? {
         get {
@@ -565,5 +630,12 @@ final class SettingsStore {
     /// Returns the full output URL for a new recording
     func generateOutputURL() -> URL {
         outputDirectory.appending(path: generateFilename())
+    }
+
+    func generateShadowPlayClipURL() -> URL {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd-HH.mm.ss"
+        let timestamp = formatter.string(from: Date())
+        return outputDirectory.appending(path: "ShadowPlay_\(timestamp).\(containerFormat.fileExtension)")
     }
 }
