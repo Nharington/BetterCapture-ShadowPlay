@@ -274,11 +274,11 @@ final class ShadowPlayBufferWriter: CaptureEngineSampleBufferDelegate, @unchecke
             logger.error("Failed to start next segment writer: \(error.localizedDescription)")
         }
 
-        return finalize(activeWriter: active)
+        return finalize(activeWriter: active, configuration: configuration)
     }
 
-    private func finalize(activeWriter toFinalize: ActiveWriter) -> () async -> Void {
-        let config = lock.withLockUnchecked { configuration }
+    private func finalize(activeWriter toFinalize: ActiveWriter, configuration: Configuration?) -> () async -> Void {
+        let config = configuration
 
         return { [weak self] in
             guard let self else { return }
