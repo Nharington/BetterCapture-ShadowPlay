@@ -175,8 +175,7 @@ final class PreviewService: NSObject {
         config.width = previewWidth
         config.height = previewHeight
 
-        // Lower frame rate for preview (5 FPS is sufficient)
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 5)
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 15)
 
         // BGRA pixel format for display
         config.pixelFormat = kCVPixelFormatType_32BGRA
@@ -196,7 +195,7 @@ final class PreviewService: NSObject {
     }
 
     /// Converts a CMSampleBuffer to an NSImage
-    private nonisolated func createImage(from sampleBuffer: CMSampleBuffer) -> NSImage? {
+    nonisolated private func createImage(from sampleBuffer: CMSampleBuffer) -> NSImage? {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
             return nil
         }

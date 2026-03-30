@@ -50,9 +50,40 @@ enum VideoCodec: String, CaseIterable, Identifiable {
     /// Whether this codec supports HDR (10-bit) recording
     var supportsHDR: Bool {
         switch self {
-        case .proRes422, .proRes4444:
+        case .hevc, .proRes422, .proRes4444:
             return true
+        case .h264:
+            return false
+        }
+    }
+
+    /// The pixel format ScreenCaptureKit and AVAssetWriter should use for HDR capture.
+    ///
+    /// Each codec requires a specific chroma subsampling and bit depth:
+    /// - HEVC Main 10: 10-bit 4:2:0
+    /// - ProRes 422: 10-bit 4:2:2
+    /// - ProRes 4444: 16-bit half-float RGBA
+    var hdrPixelFormat: OSType {
+        switch self {
+        case .hevc:
+            return kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        case .proRes422:
+            return kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange
+        case .proRes4444:
+            return kCVPixelFormatType_64RGBAHalf
+        case .h264:
+            return kCVPixelFormatType_32BGRA
+        }
+    }
+
+    /// Whether this codec supports user-adjustable quality/bitrate settings.
+    ///
+    /// ProRes codecs use fixed-quality encoding and ignore bitrate controls.
+    var supportsQualitySetting: Bool {
+        switch self {
         case .h264, .hevc:
+            return true
+        case .proRes422, .proRes4444:
             return false
         }
     }
@@ -60,8 +91,8 @@ enum VideoCodec: String, CaseIterable, Identifiable {
 
 /// Container format for output files
 enum ContainerFormat: String, CaseIterable, Identifiable {
-    case mov = "mov"
-    case mp4 = "mp4"
+    case mov
+    case mp4
 
     var id: String { rawValue }
 
@@ -128,12 +159,95 @@ enum FrameRate: Int, CaseIterable, Identifiable {
             return "\(rawValue) fps"
         }
     }
+
+    /// The effective frame rate in Hz for encoding calculations (e.g. bitrate).
+    ///
+    /// For explicit rates this returns the selected value. For `.native` it
+    /// returns 60 as a practical upper bound. Although `CaptureEngine` sets a
+    /// minimum interval of 1/120s, ScreenCaptureKit only delivers frames when
+    /// content changes, so actual rates are typically well below 120. Using 60
+    /// avoids inflating the bitrate budget beyond what the encoder will use.
+    var effectiveFrameRate: Double {
+        switch self {
+        case .native: 60.0
+        default:      Double(rawValue)
+        }
+    }
 }
 
-/// Persists user preferences using AppStorage
+/// Video quality presets controlling compression bitrate for H.264 and HEVC.
+///
+/// Each preset defines a bits-per-pixel multiplier used to calculate the
+/// target average bitrate: `width * height * bpp * frameRate`.
+/// ProRes codecs ignore this setting since they use fixed-quality encoding.
+enum VideoQuality: String, CaseIterable, Identifiable {
+    case low = "Low"
+    case medium = "Medium"
+    case high = "High"
+
+    var id: String { rawValue }
+
+    /// Bits-per-pixel multiplier for H.264
+    var h264BitsPerPixel: Double {
+        switch self {
+        case .low:    0.04
+        case .medium: 0.2
+        case .high:   0.6
+        }
+    }
+
+    /// Bits-per-pixel multiplier for HEVC (more efficient codec)
+    var hevcBitsPerPixel: Double {
+        switch self {
+        case .low:    0.02
+        case .medium: 0.15
+        case .high:   0.4
+        }
+    }
+
+    /// Returns the bits-per-pixel multiplier for the given codec
+    func bitsPerPixel(for codec: VideoCodec) -> Double? {
+        switch codec {
+        case .h264: h264BitsPerPixel
+        case .hevc: hevcBitsPerPixel
+        case .proRes422, .proRes4444: nil
+        }
+    }
+}
+
+/// Describes which ScreenCaptureKit HDR configuration is active, so the
+/// ``AssetWriter`` can tag the output container with matching colorimetry.
+enum HDRPreset {
+    /// SDR capture — no HDR color properties needed.
+    case sdr
+
+    /// Manual BT.2020 / PQ configuration applied to a plain
+    /// `SCStreamConfiguration`. Used on macOS 15–25 to produce
+    /// HDR10-compatible output (BT.2020 primaries, PQ transfer
+    /// function, BT.2020 YCbCr matrix).
+    case hdr10Manual
+
+    /// ``SCStreamConfiguration.Preset.captureHDRRecordingPreservedSDRHDR10``
+    /// (macOS 26+). Same BT.2020 / PQ colorimetry as `.hdr10Manual`, but
+    /// also injects static HDR10 mastering metadata and preserves SDR UI
+    /// appearance on HDR screens.
+    case hdr10PreservedSDR
+}
+
+/// Persists user preferences using UserDefaults
 @MainActor
 @Observable
 final class SettingsStore {
+
+    // MARK: - Dependencies
+
+    private let defaults: UserDefaults
+
+    // MARK: - Initialization
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
 
     // MARK: - Video Settings
 
@@ -143,6 +257,15 @@ final class SettingsStore {
         }
         set {
             frameRateRaw = newValue.rawValue
+        }
+    }
+
+    var videoQuality: VideoQuality {
+        get {
+            VideoQuality(rawValue: videoQualityRaw) ?? .medium
+        }
+        set {
+            videoQualityRaw = newValue.rawValue
         }
     }
 
@@ -174,6 +297,12 @@ final class SettingsStore {
             // Disable HDR for codecs that don't support it
             if !newValue.supportsHDR {
                 captureHDR = false
+            }
+
+            // HEVC with alpha uses a separate codec type that doesn't support
+            // Main 10 HDR, so alpha and HDR are mutually exclusive for HEVC.
+            if newValue == .hevc && captureHDR {
+                captureAlphaChannel = false
             }
         }
     }
@@ -214,15 +343,24 @@ final class SettingsStore {
             if !videoCodec.supportsAlphaChannel || !containerFormat.supportsAlphaChannel {
                 return false
             }
-            return UserDefaults.standard.bool(forKey: "captureAlphaChannel")
+            // HEVC with alpha uses a different codec type incompatible with Main 10 HDR
+            if videoCodec == .hevc && captureHDR {
+                return false
+            }
+            return defaults.bool(forKey: "captureAlphaChannel")
         }
         set {
             // Only allow alpha channel if both codec and container support it
             let canEnable = videoCodec.supportsAlphaChannel && containerFormat.supportsAlphaChannel
-            let finalValue = newValue && canEnable
+            var finalValue = newValue && canEnable
+
+            // HEVC alpha and HDR are mutually exclusive
+            if videoCodec == .hevc && finalValue && captureHDR {
+                finalValue = false
+            }
 
             withMutation(keyPath: \.captureAlphaChannel) {
-                UserDefaults.standard.set(finalValue, forKey: "captureAlphaChannel")
+                defaults.set(finalValue, forKey: "captureAlphaChannel")
             }
         }
     }
@@ -230,13 +368,42 @@ final class SettingsStore {
     var captureHDR: Bool {
         get {
             access(keyPath: \.captureHDR)
-            return UserDefaults.standard.bool(forKey: "captureHDR")
+            return defaults.bool(forKey: "captureHDR")
         }
         set {
             withMutation(keyPath: \.captureHDR) {
-                UserDefaults.standard.set(newValue, forKey: "captureHDR")
+                defaults.set(newValue, forKey: "captureHDR")
+            }
+
+            // HEVC alpha and HDR are mutually exclusive
+            if newValue && videoCodec == .hevc {
+                captureAlphaChannel = false
             }
         }
+    }
+
+    var captureNativeResolution: Bool {
+        get {
+            access(keyPath: \.captureNativeResolution)
+            return defaults.object(forKey: "captureNativeResolution") as? Bool ?? true
+        }
+        set {
+            withMutation(keyPath: \.captureNativeResolution) {
+                defaults.set(newValue, forKey: "captureNativeResolution")
+            }
+        }
+    }
+
+    /// The active HDR preset for the current codec and OS version.
+    ///
+    /// Both ``CaptureEngine`` and ``AssetWriter`` use this to ensure the
+    /// stream configuration and output color tags stay in sync.
+    var hdrPreset: HDRPreset {
+        guard captureHDR && videoCodec.supportsHDR else { return .sdr }
+        if #available(macOS 26, *) {
+            return .hdr10PreservedSDR
+        }
+        return .hdr10Manual
     }
 
     // MARK: - Audio Settings
@@ -244,11 +411,11 @@ final class SettingsStore {
     var captureMicrophone: Bool {
         get {
             access(keyPath: \.captureMicrophone)
-            return UserDefaults.standard.bool(forKey: "captureMicrophone")
+            return defaults.bool(forKey: "captureMicrophone")
         }
         set {
             withMutation(keyPath: \.captureMicrophone) {
-                UserDefaults.standard.set(newValue, forKey: "captureMicrophone")
+                defaults.set(newValue, forKey: "captureMicrophone")
             }
         }
     }
@@ -256,11 +423,11 @@ final class SettingsStore {
     var captureSystemAudio: Bool {
         get {
             access(keyPath: \.captureSystemAudio)
-            return UserDefaults.standard.bool(forKey: "captureSystemAudio")
+            return defaults.bool(forKey: "captureSystemAudio")
         }
         set {
             withMutation(keyPath: \.captureSystemAudio) {
-                UserDefaults.standard.set(newValue, forKey: "captureSystemAudio")
+                defaults.set(newValue, forKey: "captureSystemAudio")
             }
         }
     }
@@ -285,11 +452,11 @@ final class SettingsStore {
     var selectedMicrophoneID: String? {
         get {
             access(keyPath: \.selectedMicrophoneID)
-            return UserDefaults.standard.string(forKey: "selectedMicrophoneID")
+            return defaults.string(forKey: "selectedMicrophoneID")
         }
         set {
             withMutation(keyPath: \.selectedMicrophoneID) {
-                UserDefaults.standard.set(newValue, forKey: "selectedMicrophoneID")
+                defaults.set(newValue, forKey: "selectedMicrophoneID")
             }
         }
     }
@@ -299,11 +466,11 @@ final class SettingsStore {
     var presenterOverlayEnabled: Bool {
         get {
             access(keyPath: \.presenterOverlayEnabled)
-            return UserDefaults.standard.bool(forKey: "presenterOverlayEnabled")
+            return defaults.bool(forKey: "presenterOverlayEnabled")
         }
         set {
             withMutation(keyPath: \.presenterOverlayEnabled) {
-                UserDefaults.standard.set(newValue, forKey: "presenterOverlayEnabled")
+                defaults.set(newValue, forKey: "presenterOverlayEnabled")
             }
         }
     }
@@ -312,11 +479,11 @@ final class SettingsStore {
     var selectedCameraID: String? {
         get {
             access(keyPath: \.selectedCameraID)
-            return UserDefaults.standard.string(forKey: "selectedCameraID")
+            return defaults.string(forKey: "selectedCameraID")
         }
         set {
             withMutation(keyPath: \.selectedCameraID) {
-                UserDefaults.standard.set(newValue, forKey: "selectedCameraID")
+                defaults.set(newValue, forKey: "selectedCameraID")
             }
         }
     }
@@ -326,11 +493,11 @@ final class SettingsStore {
     var showCursor: Bool {
         get {
             access(keyPath: \.showCursor)
-            return UserDefaults.standard.object(forKey: "showCursor") as? Bool ?? true
+            return defaults.object(forKey: "showCursor") as? Bool ?? true
         }
         set {
             withMutation(keyPath: \.showCursor) {
-                UserDefaults.standard.set(newValue, forKey: "showCursor")
+                defaults.set(newValue, forKey: "showCursor")
             }
         }
     }
@@ -338,11 +505,11 @@ final class SettingsStore {
     var showWallpaper: Bool {
         get {
             access(keyPath: \.showWallpaper)
-            return UserDefaults.standard.object(forKey: "showWallpaper") as? Bool ?? true
+            return defaults.object(forKey: "showWallpaper") as? Bool ?? true
         }
         set {
             withMutation(keyPath: \.showWallpaper) {
-                UserDefaults.standard.set(newValue, forKey: "showWallpaper")
+                defaults.set(newValue, forKey: "showWallpaper")
             }
         }
     }
@@ -350,11 +517,11 @@ final class SettingsStore {
     var showMenuBar: Bool {
         get {
             access(keyPath: \.showMenuBar)
-            return UserDefaults.standard.object(forKey: "showMenuBar") as? Bool ?? true
+            return defaults.object(forKey: "showMenuBar") as? Bool ?? true
         }
         set {
             withMutation(keyPath: \.showMenuBar) {
-                UserDefaults.standard.set(newValue, forKey: "showMenuBar")
+                defaults.set(newValue, forKey: "showMenuBar")
             }
         }
     }
@@ -362,11 +529,11 @@ final class SettingsStore {
     var showDock: Bool {
         get {
             access(keyPath: \.showDock)
-            return UserDefaults.standard.object(forKey: "showDock") as? Bool ?? true
+            return defaults.object(forKey: "showDock") as? Bool ?? true
         }
         set {
             withMutation(keyPath: \.showDock) {
-                UserDefaults.standard.set(newValue, forKey: "showDock")
+                defaults.set(newValue, forKey: "showDock")
             }
         }
     }
@@ -374,11 +541,11 @@ final class SettingsStore {
     var showWindowShadows: Bool {
         get {
             access(keyPath: \.showWindowShadows)
-            return UserDefaults.standard.object(forKey: "showWindowShadows") as? Bool ?? true
+            return defaults.object(forKey: "showWindowShadows") as? Bool ?? true
         }
         set {
             withMutation(keyPath: \.showWindowShadows) {
-                UserDefaults.standard.set(newValue, forKey: "showWindowShadows")
+                defaults.set(newValue, forKey: "showWindowShadows")
             }
         }
     }
@@ -386,11 +553,11 @@ final class SettingsStore {
     var showBetterCapture: Bool {
         get {
             access(keyPath: \.showBetterCapture)
-            return UserDefaults.standard.object(forKey: "showBetterCapture") as? Bool ?? false
+            return defaults.object(forKey: "showBetterCapture") as? Bool ?? false
         }
         set {
             withMutation(keyPath: \.showBetterCapture) {
-                UserDefaults.standard.set(newValue, forKey: "showBetterCapture")
+                defaults.set(newValue, forKey: "showBetterCapture")
             }
         }
     }
@@ -471,11 +638,11 @@ final class SettingsStore {
     private var customOutputDirectoryBookmark: Data? {
         get {
             access(keyPath: \.customOutputDirectoryBookmark)
-            return UserDefaults.standard.data(forKey: "customOutputDirectoryBookmark")
+            return defaults.data(forKey: "customOutputDirectoryBookmark")
         }
         set {
             withMutation(keyPath: \.customOutputDirectoryBookmark) {
-                UserDefaults.standard.set(newValue, forKey: "customOutputDirectoryBookmark")
+                defaults.set(newValue, forKey: "customOutputDirectoryBookmark")
             }
         }
     }
@@ -569,14 +736,26 @@ final class SettingsStore {
     private var frameRateRaw: Int {
         get {
             access(keyPath: \.frameRateRaw)
-            guard UserDefaults.standard.object(forKey: "frameRate") != nil else {
+            guard defaults.object(forKey: "frameRate") != nil else {
                 return FrameRate.fps60.rawValue
             }
-            return UserDefaults.standard.integer(forKey: "frameRate")
+            return defaults.integer(forKey: "frameRate")
         }
         set {
             withMutation(keyPath: \.frameRateRaw) {
-                UserDefaults.standard.set(newValue, forKey: "frameRate")
+                defaults.set(newValue, forKey: "frameRate")
+            }
+        }
+    }
+
+    private var videoQualityRaw: String {
+        get {
+            access(keyPath: \.videoQualityRaw)
+            return defaults.string(forKey: "videoQuality") ?? VideoQuality.medium.rawValue
+        }
+        set {
+            withMutation(keyPath: \.videoQualityRaw) {
+                defaults.set(newValue, forKey: "videoQuality")
             }
         }
     }
@@ -584,11 +763,11 @@ final class SettingsStore {
     private var videoCodecRaw: String {
         get {
             access(keyPath: \.videoCodecRaw)
-            return UserDefaults.standard.string(forKey: "videoCodec") ?? VideoCodec.hevc.rawValue
+            return defaults.string(forKey: "videoCodec") ?? VideoCodec.hevc.rawValue
         }
         set {
             withMutation(keyPath: \.videoCodecRaw) {
-                UserDefaults.standard.set(newValue, forKey: "videoCodec")
+                defaults.set(newValue, forKey: "videoCodec")
             }
         }
     }
@@ -596,11 +775,11 @@ final class SettingsStore {
     private var containerFormatRaw: String {
         get {
             access(keyPath: \.containerFormatRaw)
-            return UserDefaults.standard.string(forKey: "containerFormat") ?? ContainerFormat.mov.rawValue
+            return defaults.string(forKey: "containerFormat") ?? ContainerFormat.mov.rawValue
         }
         set {
             withMutation(keyPath: \.containerFormatRaw) {
-                UserDefaults.standard.set(newValue, forKey: "containerFormat")
+                defaults.set(newValue, forKey: "containerFormat")
             }
         }
     }
@@ -608,11 +787,11 @@ final class SettingsStore {
     private var audioCodecRaw: String {
         get {
             access(keyPath: \.audioCodecRaw)
-            return UserDefaults.standard.string(forKey: "audioCodec") ?? AudioCodec.aac.rawValue
+            return defaults.string(forKey: "audioCodec") ?? AudioCodec.aac.rawValue
         }
         set {
             withMutation(keyPath: \.audioCodecRaw) {
-                UserDefaults.standard.set(newValue, forKey: "audioCodec")
+                defaults.set(newValue, forKey: "audioCodec")
             }
         }
     }

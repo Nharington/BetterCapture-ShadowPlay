@@ -15,23 +15,13 @@ struct MenuBarView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var currentPreview: NSImage?
 
+    private var isRecording: Bool { viewModel.isRecording }
+
     var body: some View {
         VStack(spacing: 0) {
-            if viewModel.isRecording {
-                recordingContent
-            } else {
-                idleContent
-            }
-        }
-        .frame(width: 320)
-    }
-
-    // MARK: - Idle State Content
-
-    private var idleContent: some View {
-        VStack(spacing: 0) {
-            // Permission status banner (if required permissions are missing)
-            if viewModel.permissionService.screenRecordingState != .granted ||
+            // Permission status banner (only when idle)
+            if !isRecording,
+               viewModel.permissionService.screenRecordingState != .granted ||
                 (viewModel.settings.captureMicrophone && viewModel.permissionService.microphoneState != .granted) {
                 PermissionStatusBanner(
                     permissionService: viewModel.permissionService,
@@ -40,26 +30,38 @@ struct MenuBarView: View {
                 MenuBarDivider()
             }
 
-            // Start Recording Button
-            MenuBarActionButton(
-                title: "Start Recording",
-                systemImage: "record.circle",
-                accentColor: .green,
-                isDisabled: !viewModel.canStartRecording
-            ) {
-                Task {
-                    await viewModel.startRecording()
-                    dismiss()
+            // Recording button (stop + timer) or Start button
+            if isRecording {
+                RecordingButton(
+                    duration: viewModel.formattedDuration
+                ) {
+                    Task {
+                        await viewModel.stopRecording()
+                    }
                 }
+                .padding(.top, 8)
+            } else {
+                MenuBarActionButton(
+                    title: "Start Recording",
+                    systemImage: "record.circle",
+                    accentColor: .green,
+                    isDisabled: !viewModel.canStartRecording
+                ) {
+                    Task {
+                        await viewModel.startRecording()
+                        dismiss()
+                    }
+                }
+                .padding(.top, 8)
             }
-            .padding(.top, 8)
 
             MenuBarDivider()
 
             // Content Selection
-            ContentSelectionButton(viewModel: viewModel, onDismissPanel: { dismiss() })
+            ContentSelectionButton(viewModel: viewModel) { dismiss() }
+                .disabled(isRecording)
 
-            // Preview thumbnail below the content selection button
+            // Preview thumbnail
             if viewModel.hasContentSelected {
                 PreviewThumbnailView(
                     previewImage: currentPreview,
@@ -96,6 +98,7 @@ struct MenuBarView: View {
                 }
                 .buttonStyle(.plain)
                 .padding(.horizontal, 12)
+                .disabled(isRecording)
             }
 
             MenuBarDivider()
@@ -104,18 +107,21 @@ struct MenuBarView: View {
 
             MenuBarDivider()
 
-            // Settings Sections (no divider between them - section headers provide separation)
-            VideoSettingsSection(settings: viewModel.settings)
+            // Settings Sections
+            Group {
+                VideoSettingsSection(settings: viewModel.settings)
 
-            PresenterOverlaySettingsSection(
-                settings: viewModel.settings,
-                cameraDeviceService: viewModel.cameraDeviceService
-            )
+                PresenterOverlaySettingsSection(
+                    settings: viewModel.settings,
+                    cameraDeviceService: viewModel.cameraDeviceService
+                )
 
-            AudioSettingsSection(
-                settings: viewModel.settings,
-                audioDeviceService: viewModel.audioDeviceService
-            )
+                AudioSettingsSection(
+                    settings: viewModel.settings,
+                    audioDeviceService: viewModel.audioDeviceService
+                )
+            }
+            .disabled(isRecording)
 
             MenuBarDivider()
 
@@ -141,22 +147,8 @@ struct MenuBarView: View {
             }
             .padding(.bottom, 8)
         }
-    }
-
-    // MARK: - Recording State Content
-
-    private var recordingContent: some View {
-        VStack(spacing: 0) {
-            // Combined Stop Recording Button with timer
-            RecordingButton(
-                duration: viewModel.formattedDuration
-            ) {
-                Task {
-                    await viewModel.stopRecording()
-                }
-            }
-            .padding(.vertical, 8)
-        }
+        .frame(width: 320)
+        .background(.ultraThinMaterial)
     }
 }
 
@@ -274,7 +266,7 @@ struct ShadowPlayMenuBarSection: View {
 /// A styled action button for menu bar window with hover effect
 struct MenuBarActionButton: View {
     let title: String
-    var systemImage: String? = nil
+    var systemImage: String?
     var accentColor: Color = .primary
     var isDisabled: Bool = false
     let action: () -> Void
@@ -363,28 +355,6 @@ struct RecordingButton: View {
     }
 }
 
-// MARK: - Content Selection Mode
-
-/// The mode for content selection: picking content via the system picker, or drawing a screen area
-enum ContentSelectionMode: String {
-    case pickContent
-    case selectArea
-
-    var label: String {
-        switch self {
-        case .pickContent: "Pick Content"
-        case .selectArea: "Select Area"
-        }
-    }
-
-    var icon: String {
-        switch self {
-        case .pickContent: "macwindow"
-        case .selectArea: "rectangle.dashed"
-        }
-    }
-}
-
 // MARK: - Content Selection Button
 
 /// A split button that triggers the active content selection mode, with a dropdown chevron to switch modes.
@@ -393,7 +363,7 @@ enum ContentSelectionMode: String {
 struct ContentSelectionButton: View {
     let viewModel: RecorderViewModel
     var onDismissPanel: (() -> Void)?
-    @AppStorage("contentSelectionMode") private var mode: ContentSelectionMode = .pickContent
+    @AppStorage(ContentSelectionMode.storageKey) private var mode: ContentSelectionMode = .pickContent
     @State private var isDropdownExpanded = false
     @State private var isMainHovered = false
     @State private var isChevronHovered = false

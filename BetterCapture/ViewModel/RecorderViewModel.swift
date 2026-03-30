@@ -36,6 +36,9 @@ final class RecorderViewModel {
     /// The selected area in screen coordinates (bottom-left origin), used for the border frame overlay
     private var selectedScreenRect: CGRect?
 
+    /// The screen on which the area selection was made
+    private var selectedScreen: NSScreen?
+
     /// Whether the current selection is an area selection (as opposed to a picker selection)
     var isAreaSelection: Bool {
         selectedSourceRect != nil
@@ -104,6 +107,7 @@ final class RecorderViewModel {
     private var videoSize: CGSize = .zero
     private let areaSelectionOverlay = AreaSelectionOverlay()
     private let selectionBorderFrame = SelectionBorderFrame()
+    private let recordingOverlay = RecordingOverlayCoordinator()
 
     // MARK: - Initialization
 
@@ -138,6 +142,24 @@ final class RecorderViewModel {
     }
 
     // MARK: - Public Methods
+
+    /// Toggles the recording state. If no content is selected, triggers the appropriate
+    /// selection flow based on the user's content selection mode preference.
+    func toggleRecording() async {
+        if isRecording {
+            await stopRecording()
+        } else if hasContentSelected {
+            await startRecording()
+        } else {
+            // No content selected — trigger selection based on the user's preferred mode
+            switch ContentSelectionMode.current {
+            case .pickContent:
+                presentPicker()
+            case .selectArea:
+                await presentAreaSelection()
+            }
+        }
+    }
 
     /// Presents the system content sharing picker
     func presentPicker() {
@@ -201,6 +223,7 @@ final class RecorderViewModel {
             // Store the area selection and set the filter on the capture engine
             selectedSourceRect = sourceRect
             selectedScreenRect = result.screenRect
+            selectedScreen = result.screen
             selectedContentFilter = filter
             try await captureEngine.updateFilter(filter)
 
@@ -208,6 +231,9 @@ final class RecorderViewModel {
 
             // Update preview with the display filter and source rect
             await previewService.setContentFilter(filter, sourceRect: sourceRect)
+
+            // Show the recording overlay on the screen where the area was selected
+            recordingOverlay.show(viewModel: self, screen: selectedScreen)
 
         } catch {
             selectionBorderFrame.dismiss()
@@ -221,6 +247,9 @@ final class RecorderViewModel {
             logger.warning("Cannot start recording: no content selected or already recording")
             return
         }
+
+        // Dismiss the recording overlay if it's still visible
+        recordingOverlay.dismiss()
 
         do {
             state = .recording
@@ -259,6 +288,11 @@ final class RecorderViewModel {
             // Start capture with the calculated video size
             logger.info("Starting capture engine...")
             try await captureEngine.startCapture(with: settings, videoSize: videoSize, sourceRect: selectedSourceRect)
+
+            // Re-show the area selection border now that capture has started
+            if isAreaSelection, let screenRect = selectedScreenRect {
+                selectionBorderFrame.show(screenRect: screenRect)
+            }
 
             // Start timer
             startTimer()
@@ -315,17 +349,14 @@ final class RecorderViewModel {
         }
     }
 
-    /// Clears the current content selection
-    func clearSelection() {
-        captureEngine.clearSelection()
-    }
-
     /// Resets the area selection, removing the border frame and clearing state
     func resetAreaSelection() async {
         selectedSourceRect = nil
         selectedScreenRect = nil
+        selectedScreen = nil
         selectedContentFilter = nil
         selectionBorderFrame.dismiss()
+        recordingOverlay.dismiss()
         await previewService.stopPreview()
         previewService.clearPreview()
     }
@@ -485,11 +516,17 @@ final class RecorderViewModel {
     // MARK: - Helper Methods
 
     private func getContentSize(from filter: SCContentFilter) async -> CGSize {
+        // Apply scale if Capture Native Resolution setting is enabled
+        let applyScale: Bool = settings.captureNativeResolution
+
         // If area selection is active, use the source rect dimensions.
         // The sourceRect is already snapped to even pixel counts in presentAreaSelection().
         if let sourceRect = selectedSourceRect {
             let scale = CGFloat(filter.pointPixelScale)
-            return CGSize(width: sourceRect.width * scale, height: sourceRect.height * scale)
+            return CGSize(
+                width: applyScale ? sourceRect.width * scale : sourceRect.width,
+                height: applyScale ? sourceRect.height * scale : sourceRect.height
+            )
         }
 
         // Get the content rect from the filter
@@ -498,16 +535,16 @@ final class RecorderViewModel {
 
         if rect.width > 0 && rect.height > 0 {
             return CGSize(
-                width: rect.width * scale,
-                height: rect.height * scale
+                width: applyScale ? rect.width * scale : rect.width,
+                height: applyScale ? rect.height * scale : rect.height
             )
         }
 
         // Fallback to main screen size
         if let screen = NSScreen.main {
             return CGSize(
-                width: screen.frame.width * screen.backingScaleFactor,
-                height: screen.frame.height * screen.backingScaleFactor
+                width: applyScale ? screen.frame.width * screen.backingScaleFactor : screen.frame.width,
+                height: applyScale ? screen.frame.height * screen.backingScaleFactor : screen.frame.height
             )
         }
 
@@ -523,6 +560,7 @@ extension RecorderViewModel: CaptureEngineDelegate {
         // Clear any area selection (picker and area selections are mutually exclusive)
         selectedSourceRect = nil
         selectedScreenRect = nil
+        selectedScreen = nil
         selectionBorderFrame.dismiss()
 
         selectedContentFilter = filter
@@ -532,6 +570,10 @@ extension RecorderViewModel: CaptureEngineDelegate {
         Task {
             await previewService.setContentFilter(filter)
         }
+
+        // Show the recording overlay. For picker selections there is no stored screen
+        // (selectedScreen is nil), so the overlay positions itself below the status item.
+        recordingOverlay.show(viewModel: self, screen: selectedScreen)
     }
 
     func captureEngine(_ engine: CaptureEngine, didStopWithError error: Error?) {
@@ -582,6 +624,9 @@ extension RecorderViewModel: CaptureEngineDelegate {
 
         // Clear the selected content filter
         selectedContentFilter = nil
+
+        // Dismiss the overlay if it was shown after a previous selection
+        recordingOverlay.dismiss()
 
         // Stop and clear the preview
         Task {
