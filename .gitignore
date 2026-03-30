@@ -98,3 +98,9 @@ Temporary Items
 
 # Snippets
 snippets/
+
+# Local AI tools
+.claude/*
+.cursor/*
+.vscode/*
+.idea/*
